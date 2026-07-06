@@ -89,7 +89,7 @@ def handle_get(path):
         body = '{"timestamp":%d,"server_time":%d,"status":"ok"}' % (ts, ts)
         return build_http_response("200 OK", body, "application/json")
     elif route == "/svrs.txt":
-        return build_http_response("200 OK", "127.0.0.1", "text/plain")
+        return build_http_response("200 OK", "api.jqone.tech", "text/plain")
     else:
         body = '{"status":"ok"}'
         return build_http_response("200 OK", body, "application/json")
