@@ -16,70 +16,40 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Hosts poison + TLS cert + portproxy
+      - name: Hosts poison + portproxy
         shell: powershell
         run: |
-          # Hosts file
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           Add-Content -Path $hosts -Value "127.0.0.1 jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 api.jqone.tech" -Force
           Write-Host "[+] Hosts poisoned"
 
-          # Self-signed cert
-          $cert = New-SelfSignedCertificate -DnsName "api.jqone.tech","jqone.tech" `
-            -CertStoreLocation "cert:\LocalMachine\My" `
-            -KeyExportPolicy Exportable `
-            -NotAfter (Get-Date).AddDays(30)
-
-          $pwd = ConvertTo-SecureString -String "honeypot" -Force -AsPlainText
-          $pfxPath = "$env:RUNNER_TEMP\api.pfx"
-          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd | Out-Null
-
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root","LocalMachine")
-          $store.Open("ReadWrite")
-          $store.Add($cert)
-          $store.Close()
-
-          $certPem = "$env:RUNNER_TEMP\cert.pem"
-          $keyPem = "$env:RUNNER_TEMP\key.pem"
-          openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nokeys -out "$certPem" 2>$null
-          openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nocerts -nodes -out "$keyPem" -passout pass: 2>$null
-          Write-Host "[+] TLS ready"
-
-          # Portproxy: 80→8080, 443→8443 (admin needed but Actions runner IS admin on Windows)
           netsh interface portproxy add v4tov4 listenport=80 listenaddress=127.0.0.1 connectport=8080 connectaddress=127.0.0.1
-          netsh interface portproxy add v4tov4 listenport=443 listenaddress=127.0.0.1 connectport=8443 connectaddress=127.0.0.1
           netsh interface portproxy show all
-          Write-Host "[+] Portproxy set"
 
-          "CERT_PEM=$certPem" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KEY_PEM=$keyPem" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Start Honeypots
+      - name: Start HTTP Honeypot (svrs.txt)
         shell: powershell
         run: |
-          $p = Start-Process -FilePath python -ArgumentList "honeypot.py --port 8080 --db http.db" -NoNewWindow -PassThru
-          Write-Host "[+] HTTP honeypot PID=$($p.Id) on :8080"
-          $p2 = Start-Process -FilePath python -ArgumentList "honeypot.py --port 8443 --db https.db --tls-cert $env:CERT_PEM --tls-key $env:KEY_PEM" -NoNewWindow -PassThru
-          Write-Host "[+] HTTPS honeypot PID=$($p2.Id) on :8443"
-          Start-Sleep -Seconds 5
-          # Verify they're listening
-          netstat -ano | findstr "8080 8443"
-          # Quick health check
-          try { $r = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3; Write-Host "[+] HTTP OK: $($r|ConvertTo-Json -Compress)" } catch { Write-Host "[-] HTTP check failed: $_" }
-          try {
-            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-            $r2 = Invoke-RestMethod "https://127.0.0.1:8443/_admin/stats" -TimeoutSec 3
-            Write-Host "[+] HTTPS OK: $($r2|ConvertTo-Json -Compress)"
-          } catch { Write-Host "[-] HTTPS check failed: $_" }
+          Start-Process -FilePath python -ArgumentList "honeypot.py --port 8080 --db http.db" -NoNewWindow
+          Start-Sleep -Seconds 2
+          try { $r = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 5; Write-Host "[+] HTTP OK: $($r|ConvertTo-Json -Compress)" } catch { Write-Host "[-] HTTP FAIL: $_" }
+
+      - name: Start TCP Honeypot (RPC capture)
+        shell: powershell
+        run: |
+          # Capture on common MTProto ports
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 8443 --db rpc_8443.db" -NoNewWindow
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 9443 --db rpc_9443.db" -NoNewWindow
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 4443 --db rpc_4443.db" -NoNewWindow
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 5222 --db rpc_5222.db" -NoNewWindow
+          Start-Sleep -Seconds 2
+          netstat -ano | findstr "8443 9443 4443 5222"
 
       - name: Download and Run JQOneMatrixN
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
-          $size = (Get-Item jqone.exe).length
-          Write-Host "[+] Downloaded $size bytes"
-          # Launch and capture stdout/stderr
+          Write-Host "[+] Downloaded $( (Get-Item jqone.exe).length ) bytes"
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "$pwd\jqone.exe"
           $psi.UseShellExecute = $false
@@ -87,41 +57,28 @@ jobs:
           $psi.RedirectStandardError = $true
           $psi.CreateNoWindow = $true
           $proc = [System.Diagnostics.Process]::Start($psi)
+          Write-Host "[+] Started PID=$($proc.Id)"
           $stdout = $proc.StandardOutput.ReadToEnd()
           $stderr = $proc.StandardError.ReadToEnd()
-          $proc.WaitForExit(60000)
-          Write-Host "[+] Exit code: $($proc.ExitCode)"
-          if ($stdout) { Write-Host "=== STDOUT ===`n$stdout" }
-          if ($stderr) { Write-Host "=== STDERR ===`n$stderr" }
-          if (-not $stdout -and -not $stderr) { Write-Host "[!] No output - exe may be GUI-only or crashed silently" }
+          $proc.WaitForExit(120000)
+          Write-Host "[+] Exit=$($proc.ExitCode)"
+          if ($stdout) { Write-Host "STDOUT: $stdout" }
+          if ($stderr) { Write-Host "STDERR: $stderr" }
+          if (-not $stdout -and -not $stderr) { Write-Host "[!] No console output (GUI app)" }
 
-      - name: Wait for network activity
+      - name: Wait for RPC activity
+        shell: powershell
+        run: Start-Sleep -Seconds 60
+
+      - name: Dump HTTP Honeypot
         shell: powershell
         run: |
-          Write-Host "[+] Waiting 60s for any delayed connections..."
-          Start-Sleep -Seconds 60
+          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 5; Write-Host "HTTP: $($s|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP dead: $_" }
+          try { $c = Invoke-RestMethod "http://127.0.0.1:8080/_admin/creds" -TimeoutSec 5; Write-Host "CREDS: $($c|ConvertTo-Json -Depth 3 -Compress)" } catch { Write-Host "HTTP creds: $_" }
 
-      - name: Dump captures
+      - name: Dump TCP Honeypot
         shell: powershell
-        run: |
-          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats"; Write-Host "HTTP stats: $($s|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP: $_" }
-          try { $c = Invoke-RestMethod "http://127.0.0.1:8080/_admin/creds"; Write-Host "HTTP creds: $($c|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP creds err: $_" }
-          try {
-            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-            $s2 = Invoke-RestMethod "https://127.0.0.1:8443/_admin/stats"
-            $c2 = Invoke-RestMethod "https://127.0.0.1:8443/_admin/creds"
-            Write-Host "HTTPS stats: $($s2|ConvertTo-Json -Compress)"
-            Write-Host "HTTPS creds: $($c2|ConvertTo-Json -Compress)"
-          } catch { Write-Host "HTTPS: $_" }
-
-      - name: Dump hosts + netstat
-        if: always()
-        shell: powershell
-        run: |
-          Write-Host "=== HOSTS ==="
-          Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" | Select-String "jqone"
-          Write-Host "=== NETSTAT ==="
-          netstat -ano | findstr "8080 8443 80 443"
+        run: python dump_tcp.py
 
       - name: Upload artifacts
         if: always()
@@ -129,6 +86,5 @@ jobs:
         with:
           name: honeypot-captures
           path: |
-            *.json
             *.db
             *.txt
