@@ -6,74 +6,64 @@ on:
 jobs:
   crack:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download + Extract DLLs
+      - name: Download EXE
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
           Write-Host "[+] EXE: $((Get-Item jqone.exe).length) bytes"
 
-          # Run briefly to trigger self-extraction
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = (Join-Path (Get-Location) "jqone.exe")
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $proc = [System.Diagnostics.Process]::Start($psi)
-          Start-Sleep -Seconds 10
-          if (-not $proc.HasExited) { $proc.Kill() }
-          Write-Host "[+] EXE ran 10s"
-
-          # Collect ALL extracted assemblies (not just .net temp — also check app temp)
-          mkdir extracted -Force
-          $paths = @(
-            "$env:LOCALAPPDATA\Temp\.net",
-            "$env:TEMP\.net",
-            "$env:LOCALAPPDATA\Temp\.net\JQOneMatrixN",
-            "$env:TEMP\.net\JQOneMatrixN"
-          )
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Get-ChildItem $p -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
-                Copy-Item $_.FullName "extracted\$($_.Name)" -Force -ErrorAction SilentlyContinue
-              }
-            }
-          }
-          
-          Write-Host "=== Extracted DLLs ==="
-          Get-ChildItem extracted -Filter "*.dll" | Sort-Object Length -Descending | Select-Object Name, Length | Format-Table -AutoSize
-          
-          $count = @(Get-ChildItem extracted -Filter "*.dll").Count
-          Write-Host "[+] Total: $count DLLs"
-
-      - name: Scan for License Strings
+      - name: Extract Single-File Bundle
         shell: powershell
         run: |
-          if (-not (Test-Path "extracted\*.dll")) {
-            Write-Host "[-] No DLLs"
-            exit 0
+          # Compile and run our bundle extractor
+          $refs = @("System.dll", "System.Core.dll")
+          $refArgs = ($refs | ForEach-Object { "/r:`"$_`"" }) -join " "
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            Write-Host "[-] csc not found, using dotnet"
+            # Build with dotnet SDK
+            mkdir extractor -Force
+            cd extractor
+            dotnet new console --force 2>&1 | Out-Null
+            Copy-Item -Force ..\BundleExtractor.cs Program.cs
+            dotnet run -c Release -- ..\jqone.exe 2>&1
+            cd ..
+            if (Test-Path "extracted_asm\*.dll") { exit 0 }
+          } else {
+            & $csc /out:BundleExtractor.exe BundleExtractor.cs /t:exe 2>&1
+            .\BundleExtractor.exe jqone.exe 2>&1
           }
-          Get-ChildItem extracted -Filter "*.dll" | Sort-Object Length -Descending | ForEach-Object {
+
+          if (-not (Test-Path "extracted_asm\*.dll")) {
+            Write-Host "[-] Bundle extraction failed, trying sfextract..."
+            dotnet tool install -g sfextract 2>&1 | Select-Object -Last 3
+            sfextract jqone.exe -o extracted_asm 2>&1
+          }
+
+          Write-Host "=== Extracted ==="
+          Get-ChildItem extracted_asm -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending |
+            Select-Object Name, @{N='KB';E={[math]::Round($_.Length/1KB)}} |
+            Format-Table -AutoSize
+
+      - name: Scan DLLs for License Strings
+        shell: powershell
+        run: |
+          if (-not (Test-Path "extracted_asm\*.dll")) { exit 0 }
+          Get-ChildItem extracted_asm -Filter "*.dll" | Sort-Object Length -Descending | ForEach-Object {
             Write-Host "=== $($_.Name) ($([math]::Round($_.Length/1KB))KB) ==="
-            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-            $text = [System.Text.Encoding]::Unicode.GetString($bytes)
-            $hits = @("VerifySignature","IsRegisterValid","TGLicense","License",
-                       "BEGIN PUBLIC","RSAKeyValue","Modulus","BouncyCastle",
-                       "ECDsa","ProduceLicense","MaxAccounts","register_time",
-                       "ProductFeatures","Expiration","public.*key","KeyPair",
-                       "Standard.Licensing","VerifyData","SignedXml")
-            foreach ($h in $hits) {
-              if ($text -imatch $h) {
-                $idx = $text.IndexOf($h)
-                $start = [Math]::Max(0, $idx - 30)
-                $len = [Math]::Min(150, $text.Length - $start)
-                $ctx = $text.Substring($start, $len) -replace '[^\x20-\x7E]','.'
-                Write-Host "  [$h] ...$ctx..."
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            $text = [Text.Encoding]::Unicode.GetString($bytes)
+            foreach ($kw in @("VerifySignature","IsRegisterValid","TGLicense","License","BEGIN PUBLIC","RSAKeyValue","Modulus","BouncyCastle","ECDsa","ProduceLicense","MaxAccounts","register_time")) {
+              if ($text -imatch $kw) {
+                $idx = $text.IndexOf($kw)
+                $start = [Math]::Max(0, $idx - 20)
+                $len = [Math]::Min(120, $text.Length - $start)
+                Write-Host "  [$kw] ...$($text.Substring($start, $len) -replace '[^\x20-\x7E]','.')..."
               }
             }
           }
@@ -81,43 +71,33 @@ jobs:
       - name: Build + Run Patcher
         shell: powershell
         run: |
+          $targets = @(Get-ChildItem extracted_asm -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike "System.*" -and $_.Name -notlike "Microsoft.*" -and $_.Name -notlike "netstandard.*" } |
+            Sort-Object Length -Descending)
+          if ($targets.Count -eq 0) { $targets = @(Get-ChildItem extracted_asm -Filter "*.dll") }
+          if ($targets.Count -eq 0) { Write-Host "[-] No DLLs"; exit 1 }
+          
+          Write-Host "[+] Targets: $($targets.Count) DLLs"
+          
           mkdir patcher -Force
           cd patcher
-          dotnet new console --force 2>&1 | Select-Object -Last 3
-          dotnet add package dnlib 2>&1 | Select-Object -Last 3
+          dotnet new console --force 2>&1 | Out-Null
+          dotnet add package dnlib 2>&1 | Out-Null
           Copy-Item -Force ..\Patcher.cs Program.cs
+          dotnet build -c Release 2>&1 | Select-Object -Last 5
           
-          Write-Host "--- Building ---"
-          dotnet build -c Release 2>&1
-          $buildOk = ($LASTEXITCODE -eq 0)
+          if ($LASTEXITCODE -ne 0) { Write-Host "[-] Build FAILED"; exit 1 }
+          Write-Host "[+] Built OK"
           
-          if (-not $buildOk) {
-            Write-Host "[-] Build FAILED"
-            exit 1
-          }
-          
-          Write-Host "[+] Build OK"
-          $dllDir = "..\extracted"
-          $dlls = @(Get-ChildItem $dllDir -Filter "*.dll" | Sort-Object Length -Descending)
-          Write-Host "DLLs found: $($dlls.Count)"
-          $dlls | ForEach-Object { Write-Host "  $($_.Name) $($_.Length)" }
-          
-          if ($dlls.Count -eq 0) {
-            Write-Host "[-] No DLLs"
-            exit 1
-          }
-          
-          # Try each DLL — start with the largest (most likely the main app)
-          foreach ($dll in $dlls) {
-            Write-Host "--- Patching $($dll.Name) ---"
-            dotnet run -c Release -- $dll.FullName 2>&1 | Select-Object -First 50
+          foreach ($dll in $targets) {
+            Write-Host "--- $($dll.Name) ---"
+            dotnet run -c Release -- $dll.FullName 2>&1 | Select-Object -First 40
           }
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: cracked-output
           path: |
             *_cracked.dll
-            extracted/
+            extracted_asm/
