@@ -65,7 +65,7 @@ jobs:
 
           # Launch EXE
           $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "$pwd\jqone.exe"
+          $psi.FileName = (Join-Path (Get-Location) "jqone.exe")
           $psi.UseShellExecute = $false
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
