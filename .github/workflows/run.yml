@@ -16,24 +16,31 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Hosts poison + portproxy 80→8080
+      - name: Hosts poison + portproxy
         shell: powershell
         run: |
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           Add-Content -Path $hosts -Value "127.0.0.1 jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 api.jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 www.jqone.tech" -Force
+          # Port 80 → 8080 (HTTP svrs.txt), Port 443 → 8443 (RPC)
           netsh interface portproxy add v4tov4 listenport=80 listenaddress=127.0.0.1 connectport=8080 connectaddress=127.0.0.1
+          netsh interface portproxy add v4tov4 listenport=443 listenaddress=127.0.0.1 connectport=8443 connectaddress=127.0.0.1
+          netsh interface portproxy show all
 
-      - name: Start HTTP + TCP Honeypots
+      - name: Start HTTP Honeypot (svrs.txt)
         shell: powershell
         run: |
           Start-Process -FilePath python -ArgumentList "honeypot.py --port 8080 --db http.db" -NoNewWindow
-          foreach ($p in @(443, 8443, 9443, 4443, 5222, 10808, 3000, 8081, 9090)) {
-            Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port $p --db rpc_$p.db" -NoNewWindow
-          }
-          Start-Sleep -Seconds 3
-          netstat -ano | findstr "LISTENING"
+          Start-Sleep -Seconds 2
+          try { Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3 | Out-Null; Write-Host "[+] HTTP OK" } catch { Write-Host "[-] HTTP FAIL" }
+
+      - name: Start TCP Honeypot (RPC on 8443)
+        shell: powershell
+        run: |
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 8443 --db rpc.db" -NoNewWindow
+          Start-Sleep -Seconds 2
+          netstat -ano | findstr "8443"
 
       - name: Run EXE + capture netstat
         shell: powershell
@@ -77,12 +84,15 @@ jobs:
           Write-Host "=== HOSTS ==="
           Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" | Select-String "jqone"
 
-      - name: Dump all DBs
+      - name: Dump all captures
         if: always()
         shell: powershell
         run: |
-          python dump_tcp.py
-          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3; Write-Host "HTTP: $($s|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP: $_" }
+          Write-Host "=== HTTP Honeypot ==="
+          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3; Write-Host "Stats: $($s|ConvertTo-Json -Compress)"; $c = Invoke-RestMethod "http://127.0.0.1:8080/_admin/creds" -TimeoutSec 3; Write-Host "Creds: $($c|ConvertTo-Json -Depth 3 -Compress)" } catch { Write-Host "HTTP dead: $_" }
+
+          Write-Host "=== TCP Honeypot ==="
+          python dump_rpc.py
 
       - name: Upload artifacts
         if: always()
