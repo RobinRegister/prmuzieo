@@ -1,12 +1,12 @@
-name: JQOneMatrix Honeypot
+name: JQOneMatrix Net Trace
 
 on:
   workflow_dispatch:
 
 jobs:
-  capture:
+  trace:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -16,40 +16,31 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Hosts poison + portproxy
+      - name: Hosts poison + portproxy 80→8080
         shell: powershell
         run: |
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           Add-Content -Path $hosts -Value "127.0.0.1 jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 api.jqone.tech" -Force
-          Write-Host "[+] Hosts poisoned"
-
+          Add-Content -Path $hosts -Value "127.0.0.1 www.jqone.tech" -Force
           netsh interface portproxy add v4tov4 listenport=80 listenaddress=127.0.0.1 connectport=8080 connectaddress=127.0.0.1
-          netsh interface portproxy show all
 
-      - name: Start HTTP Honeypot (svrs.txt)
+      - name: Start HTTP + TCP Honeypots
         shell: powershell
         run: |
           Start-Process -FilePath python -ArgumentList "honeypot.py --port 8080 --db http.db" -NoNewWindow
-          Start-Sleep -Seconds 2
-          try { $r = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 5; Write-Host "[+] HTTP OK: $($r|ConvertTo-Json -Compress)" } catch { Write-Host "[-] HTTP FAIL: $_" }
+          foreach ($p in @(443, 8443, 9443, 4443, 5222, 10808, 3000, 8081, 9090)) {
+            Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port $p --db rpc_$p.db" -NoNewWindow
+          }
+          Start-Sleep -Seconds 3
+          netstat -ano | findstr "LISTENING"
 
-      - name: Start TCP Honeypot (RPC capture)
-        shell: powershell
-        run: |
-          # Capture on common MTProto ports
-          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 8443 --db rpc_8443.db" -NoNewWindow
-          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 9443 --db rpc_9443.db" -NoNewWindow
-          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 4443 --db rpc_4443.db" -NoNewWindow
-          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 5222 --db rpc_5222.db" -NoNewWindow
-          Start-Sleep -Seconds 2
-          netstat -ano | findstr "8443 9443 4443 5222"
-
-      - name: Download and Run JQOneMatrixN
+      - name: Run EXE + capture netstat
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
-          Write-Host "[+] Downloaded $( (Get-Item jqone.exe).length ) bytes"
+          Write-Host "[+] Downloaded"
+
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "$pwd\jqone.exe"
           $psi.UseShellExecute = $false
@@ -57,34 +48,47 @@ jobs:
           $psi.RedirectStandardError = $true
           $psi.CreateNoWindow = $true
           $proc = [System.Diagnostics.Process]::Start($psi)
-          Write-Host "[+] Started PID=$($proc.Id)"
+          $pid = $proc.Id
+          Write-Host "[+] EXE PID=$pid"
+
+          # Poll netstat every 5s for 90s
+          for ($i=0; $i -lt 18; $i++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) { Write-Host "[+] EXE exited at +$($i*5)s code=$($proc.ExitCode)"; break }
+            $conns = netstat -ano | Select-String "^\s*TCP.*($pid|LISTENING)"
+            if ($conns) { Write-Host "  [t+$($i*5)s] $($conns -join ' | ')" }
+          }
+
           $stdout = $proc.StandardOutput.ReadToEnd()
           $stderr = $proc.StandardError.ReadToEnd()
-          $proc.WaitForExit(120000)
-          Write-Host "[+] Exit=$($proc.ExitCode)"
+          if (-not $proc.HasExited) { $proc.Kill(); Write-Host "[+] Killed" }
+          Write-Host "[+] Final exit=$($proc.ExitCode)"
           if ($stdout) { Write-Host "STDOUT: $stdout" }
           if ($stderr) { Write-Host "STDERR: $stderr" }
-          if (-not $stdout -and -not $stderr) { Write-Host "[!] No console output (GUI app)" }
 
-      - name: Wait for RPC activity
-        shell: powershell
-        run: Start-Sleep -Seconds 60
-
-      - name: Dump HTTP Honeypot
+      - name: Final netstat
+        if: always()
         shell: powershell
         run: |
-          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 5; Write-Host "HTTP: $($s|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP dead: $_" }
-          try { $c = Invoke-RestMethod "http://127.0.0.1:8080/_admin/creds" -TimeoutSec 5; Write-Host "CREDS: $($c|ConvertTo-Json -Depth 3 -Compress)" } catch { Write-Host "HTTP creds: $_" }
+          Write-Host "=== LISTENING ==="
+          netstat -ano | findstr "LISTENING"
+          Write-Host "=== ESTABLISHED ==="
+          netstat -ano | findstr "ESTABLISHED"
+          Write-Host "=== HOSTS ==="
+          Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" | Select-String "jqone"
 
-      - name: Dump TCP Honeypot
+      - name: Dump all DBs
+        if: always()
         shell: powershell
-        run: python dump_tcp.py
+        run: |
+          python dump_tcp.py
+          try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3; Write-Host "HTTP: $($s|ConvertTo-Json -Compress)" } catch { Write-Host "HTTP: $_" }
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: honeypot-captures
+          name: net-trace
           path: |
             *.db
             *.txt
