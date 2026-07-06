@@ -55,29 +55,37 @@ jobs:
       - name: Install de4dot
         shell: powershell
         run: |
-          dotnet tool install -g de4dot 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "[*] de4dot already installed or failed, continuing..."
-          } else {
-            Write-Host "[+] de4dot installed"
+          # Download de4dot from GitHub releases
+          $url = "https://github.com/de4dot/de4dot/releases/download/v3.2.0/de4dot-net48.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile "de4dot.zip"
+            Expand-Archive de4dot.zip -DestinationPath de4dot -Force
+            Write-Host "[+] de4dot downloaded"
+          } catch {
+            Write-Host "[-] de4dot download failed: $_"
+            Write-Host "[*] Will continue with obfuscated DLLs"
           }
 
       - name: Deobfuscate
         shell: powershell
         run: |
           if (-not (Test-Path "extracted\*.dll")) {
-            Write-Host "[-] No DLLs to deobfuscate. Listing temp..."
-            Get-ChildItem "$env:TEMP\.net" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object FullName -First 30
-            # Try alternate location
-            $alt = Get-ChildItem "$env:LOCALAPPDATA\Temp\.net" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue
-            if ($alt) { $alt | ForEach-Object { Copy-Item $_.FullName "extracted\" -Force } }
+            Write-Host "[-] No DLLs to deobfuscate"
+            exit 0
           }
           
-          if (Test-Path "extracted\*.dll") {
-            de4dot -r extracted -o deobfuscated --dont-rename 2>&1 | Select-Object -First 20
-            Write-Host "[+] Deobfuscated"
-            Get-ChildItem deobfuscated -Filter "*.dll" | Select-Object Name, Length | Format-Table -AutoSize
+          if (Test-Path "de4dot\de4dot.exe") {
+            .\de4dot\de4dot.exe -r extracted -o deobfuscated --dont-rename 2>&1 | Select-Object -First 30
+            if (Test-Path "deobfuscated\*.dll") {
+              Write-Host "[+] Deobfuscation successful"
+            }
+          } else {
+            Write-Host "[-] de4dot not available, using obfuscated DLLs"
+            mkdir deobfuscated -Force
+            Copy-Item extracted\*.dll deobfuscated\ -Force
           }
+          
+          Get-ChildItem deobfuscated -Filter "*.dll" | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Scan for License + Key Strings
         shell: powershell
