@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Hosts + Portproxy + Honeypots + EXE
+      - name: Hosts + TLS Cert + Portproxy + Honeypots + EXE
         shell: powershell
         run: |
           # Hosts poison
@@ -24,6 +24,25 @@ jobs:
           Add-Content -Path $hosts -Value "127.0.0.1 jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 api.jqone.tech" -Force
           Write-Host "[+] Hosts done"
+
+          # Generate self-signed cert for TLS handshake
+          $cert = New-SelfSignedCertificate -DnsName "jqone.tech","api.jqone.tech" `
+            -CertStoreLocation "cert:\LocalMachine\My" `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddDays(30)
+          $pwd = ConvertTo-SecureString -String "honeypot" -Force -AsPlainText
+          $pfxPath = "$env:RUNNER_TEMP\api.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd | Out-Null
+          $certPem = "$env:RUNNER_TEMP\cert.pem"
+          $keyPem = "$env:RUNNER_TEMP\key.pem"
+          openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nokeys -out "$certPem" 2>$null
+          openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nocerts -nodes -out "$keyPem" -passout pass: 2>$null
+          # Trust it so EXE doesn't reject
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root","LocalMachine")
+          $store.Open("ReadWrite")
+          $store.Add($cert)
+          $store.Close()
+          Write-Host "[+] TLS cert ready"
 
           # Portproxy: 80→8080 (HTTP), 443→8443 (RPC)
           netsh interface portproxy add v4tov4 listenport=80 listenaddress=127.0.0.1 connectport=8080 connectaddress=127.0.0.1
@@ -35,8 +54,8 @@ jobs:
           Start-Sleep -Seconds 2
           try { Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3 | Out-Null; Write-Host "[+] HTTP honeypot OK" } catch { Write-Host "[-] HTTP FAIL: $_" }
 
-          # Start TCP honeypot on 8443
-          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 8443 --db rpc.db" -NoNewWindow
+          # Start TCP+TLS honeypot on 8443 with cert
+          Start-Process -FilePath python -ArgumentList "tcp_honeypot.py --port 8443 --db rpc.db --tls --cert $certPem --key $keyPem" -NoNewWindow
           Start-Sleep -Seconds 2
           netstat -ano | findstr "8443"
 
@@ -81,7 +100,7 @@ jobs:
           Write-Host "=== HTTP Honeypot ==="
           try { $s = Invoke-RestMethod "http://127.0.0.1:8080/_admin/stats" -TimeoutSec 3; Write-Host "Stats: $($s|ConvertTo-Json -Compress)"; $c = Invoke-RestMethod "http://127.0.0.1:8080/_admin/creds" -TimeoutSec 3; Write-Host "Creds: $($c|ConvertTo-Json -Depth 3 -Compress)" } catch { Write-Host "HTTP: $_" }
 
-          Write-Host "=== TCP Honeypot ==="
+          Write-Host "=== TCP+TLS Honeypot ==="
           python dump_rpc.py
 
       - name: Upload artifacts
