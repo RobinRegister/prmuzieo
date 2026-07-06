@@ -14,56 +14,45 @@ jobs:
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
-          Write-Host "[+] EXE: $((Get-Item jqone.exe).length) bytes"
+          Write-Host "[+] $( (Get-Item jqone.exe).length) bytes"
 
-      - name: Extract Single-File Bundle
+      - name: Extract Bundle + Scan
         shell: powershell
         run: |
-          # Compile and run our bundle extractor
-          $refs = @("System.dll", "System.Core.dll")
-          $refArgs = ($refs | ForEach-Object { "/r:`"$_`"" }) -join " "
-          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          if (-not (Test-Path $csc)) {
-            Write-Host "[-] csc not found, using dotnet"
-            # Build with dotnet SDK
-            mkdir extractor -Force
-            cd extractor
-            dotnet new console --force 2>&1 | Out-Null
-            Copy-Item -Force ..\BundleExtractor.cs Program.cs
-            dotnet run -c Release -- ..\jqone.exe 2>&1
-            cd ..
-            if (Test-Path "extracted_asm\*.dll") { exit 0 }
-          } else {
-            & $csc /out:BundleExtractor.exe BundleExtractor.cs /t:exe 2>&1
-            .\BundleExtractor.exe jqone.exe 2>&1
+          mkdir extractor -Force
+          cd extractor
+          dotnet new console --force 2>&1 | Out-Null
+          Copy-Item ..\BundleExtractor.cs Program.cs -Force
+          dotnet run -c Release -- ..\jqone.exe 2>&1
+          cd ..
+          
+          if (Test-Path "extractor\extracted_asm\*.dll") {
+            Move-Item extractor\extracted_asm\* extracted_asm\ -Force
+          } elseif (-not (Test-Path "extracted_asm\*.dll")) {
+            Write-Host "[-] Bundle extraction empty, trying sfextract..."
+            dotnet tool install -g sfextract 2>&1 | Select-Object -Last 2
+            sfextract jqone.exe -o extracted_asm 2>&1 | Select-Object -First 10
           }
-
-          if (-not (Test-Path "extracted_asm\*.dll")) {
-            Write-Host "[-] Bundle extraction failed, trying sfextract..."
-            dotnet tool install -g sfextract 2>&1 | Select-Object -Last 3
-            sfextract jqone.exe -o extracted_asm 2>&1
-          }
-
-          Write-Host "=== Extracted ==="
-          Get-ChildItem extracted_asm -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Sort-Object Length -Descending |
-            Select-Object Name, @{N='KB';E={[math]::Round($_.Length/1KB)}} |
-            Format-Table -AutoSize
-
-      - name: Scan DLLs for License Strings
-        shell: powershell
-        run: |
-          if (-not (Test-Path "extracted_asm\*.dll")) { exit 0 }
-          Get-ChildItem extracted_asm -Filter "*.dll" | Sort-Object Length -Descending | ForEach-Object {
-            Write-Host "=== $($_.Name) ($([math]::Round($_.Length/1KB))KB) ==="
-            $bytes = [IO.File]::ReadAllBytes($_.FullName)
-            $text = [Text.Encoding]::Unicode.GetString($bytes)
-            foreach ($kw in @("VerifySignature","IsRegisterValid","TGLicense","License","BEGIN PUBLIC","RSAKeyValue","Modulus","BouncyCastle","ECDsa","ProduceLicense","MaxAccounts","register_time")) {
-              if ($text -imatch $kw) {
-                $idx = $text.IndexOf($kw)
-                $start = [Math]::Max(0, $idx - 20)
-                $len = [Math]::Min(120, $text.Length - $start)
-                Write-Host "  [$kw] ...$($text.Substring($start, $len) -replace '[^\x20-\x7E]','.')..."
+          
+          mkdir extracted_asm -Force
+          Write-Host "=== Extracted Assemblies ==="
+          $all = @(Get-ChildItem extracted_asm -Filter "*.dll" -ErrorAction SilentlyContinue | Sort-Object Length -Descending)
+          $all | Select-Object Name, @{N='KB';E={[math]::Round($_.Length/1KB)}} | Format-Table -AutoSize
+          
+          # Check which are managed
+          Write-Host "=== Managed vs Native ==="
+          foreach ($d in $all) {
+            $b = [IO.File]::ReadAllBytes($d.FullName)
+            if ($b.Length -gt 512) {
+              $pe = [BitConverter]::ToInt32($b, 0x3C)
+              if ($pe -gt 0 -and $pe -lt $b.Length - 240) {
+                $cli = $pe + 24 + 208
+                if ($cli -lt $b.Length - 8) {
+                  $rva = [BitConverter]::ToInt32($b, $cli)
+                  $type = if ($rva -eq 0) { "NATIVE" } else { "MANAGED" }
+                  $color = if ($type -eq "MANAGED") { "GREEN" } else { "RED" }
+                  Write-Host "  $type $($d.Name) $([math]::Round($d.Length/1KB))KB"
+                }
               }
             }
           }
@@ -72,27 +61,27 @@ jobs:
         shell: powershell
         run: |
           $targets = @(Get-ChildItem extracted_asm -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notlike "System.*" -and $_.Name -notlike "Microsoft.*" -and $_.Name -notlike "netstandard.*" } |
             Sort-Object Length -Descending)
-          if ($targets.Count -eq 0) { $targets = @(Get-ChildItem extracted_asm -Filter "*.dll") }
           if ($targets.Count -eq 0) { Write-Host "[-] No DLLs"; exit 1 }
           
-          Write-Host "[+] Targets: $($targets.Count) DLLs"
+          Write-Host "[+] $($targets.Count) DLLs to patch"
           
           mkdir patcher -Force
           cd patcher
           dotnet new console --force 2>&1 | Out-Null
           dotnet add package dnlib 2>&1 | Out-Null
-          Copy-Item -Force ..\Patcher.cs Program.cs
+          Copy-Item ..\Patcher.cs Program.cs -Force
           dotnet build -c Release 2>&1 | Select-Object -Last 5
           
-          if ($LASTEXITCODE -ne 0) { Write-Host "[-] Build FAILED"; exit 1 }
-          Write-Host "[+] Built OK"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           
-          foreach ($dll in $targets) {
-            Write-Host "--- $($dll.Name) ---"
-            dotnet run -c Release -- $dll.FullName 2>&1 | Select-Object -First 40
+          foreach ($d in $targets) {
+            Write-Host "--- $($d.Name) ---"
+            dotnet run -c Release -- $d.FullName 2>&1 | Select-Object -First 50
           }
+          
+          Write-Host "=== Patched DLLs ==="
+          Get-ChildItem ..\extracted_asm -Filter "*_cracked*" -Recurse | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         if: always()
