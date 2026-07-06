@@ -47,22 +47,22 @@ jobs:
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
           $psi.CreateNoWindow = $true
-          $proc = [System.Diagnostics.Process]::Start($psi)
-          $pid = $proc.Id
-          Write-Host "[+] EXE PID=$pid"
+          $exeProc = [System.Diagnostics.Process]::Start($psi)
+          $exePid = $exeProc.Id
+          Write-Host "[+] EXE PID=$exePid"
 
           # Poll netstat every 5s for 90s
           for ($i=0; $i -lt 18; $i++) {
             Start-Sleep -Seconds 5
-            if ($proc.HasExited) { Write-Host "[+] EXE exited at +$($i*5)s code=$($proc.ExitCode)"; break }
-            $conns = netstat -ano | Select-String "^\s*TCP.*($pid|LISTENING)"
+            if ($exeProc.HasExited) { Write-Host "[+] EXE exited at +$($i*5)s code=$($exeProc.ExitCode)"; break }
+            $conns = netstat -ano | Select-String "^\s*TCP.*($exePid|LISTENING)"
             if ($conns) { Write-Host "  [t+$($i*5)s] $($conns -join ' | ')" }
           }
 
-          $stdout = $proc.StandardOutput.ReadToEnd()
-          $stderr = $proc.StandardError.ReadToEnd()
-          if (-not $proc.HasExited) { $proc.Kill(); Write-Host "[+] Killed" }
-          Write-Host "[+] Final exit=$($proc.ExitCode)"
+          $stdout = $exeProc.StandardOutput.ReadToEnd()
+          $stderr = $exeProc.StandardError.ReadToEnd()
+          if (-not $exeProc.HasExited) { $exeProc.Kill(); Write-Host "[+] Killed" }
+          Write-Host "[+] Final exit=$($exeProc.ExitCode)"
           if ($stdout) { Write-Host "STDOUT: $stdout" }
           if ($stderr) { Write-Host "STDERR: $stderr" }
 
