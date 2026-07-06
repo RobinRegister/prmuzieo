@@ -2,7 +2,6 @@ name: JQOneMatrix Honeypot
 
 on:
   workflow_dispatch:
-  push:
 
 jobs:
   capture:
@@ -20,87 +19,79 @@ jobs:
       - name: Install deps + hosts poison + self-signed TLS
         shell: powershell
         run: |
-          # Hosts file redirection
           $hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
           Add-Content -Path $hosts -Value "127.0.0.1 jqone.tech" -Force
           Add-Content -Path $hosts -Value "127.0.0.1 api.jqone.tech" -Force
           Write-Host "[+] Hosts poisoned"
-          Get-Content $hosts | Select-String "jqone"
 
-          # Self-signed cert for TLS interception
           $cert = New-SelfSignedCertificate -DnsName "api.jqone.tech","jqone.tech" `
             -CertStoreLocation "cert:\LocalMachine\My" `
             -KeyExportPolicy Exportable `
             -NotAfter (Get-Date).AddDays(30)
 
-          # Export to PFX for Python
           $pwd = ConvertTo-SecureString -String "honeypot" -Force -AsPlainText
           $pfxPath = "$env:RUNNER_TEMP\api.jqone.tech.pfx"
           Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd | Out-Null
 
-          # Trust as root CA
           $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root","LocalMachine")
           $store.Open("ReadWrite")
           $store.Add($cert)
           $store.Close()
           Write-Host "[+] CA trusted"
 
-          # Export cert+key as PEM for Python ssl
           $certPem = "$env:RUNNER_TEMP\cert.pem"
           $keyPem = "$env:RUNNER_TEMP\key.pem"
           openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nokeys -out "$certPem" 2>$null
           openssl pkcs12 -in "$pfxPath" -passin pass:honeypot -nocerts -nodes -out "$keyPem" -passout pass: 2>$null
-          Write-Host "[+] PEM cert+key ready"
+          Write-Host "[+] PEM cert+key ready at $certPem"
 
-          # Persist paths
           "CERT_PEM=$certPem" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "KEY_PEM=$keyPem" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Start Honeypot HTTP
-        shell: cmd
+      - name: Start Honeypots
+        shell: powershell
         run: |
-          start /B python honeypot.py --port 80 --db http.db > http_log.txt 2>&1
-
-      - name: Start Honeypot HTTPS
-        shell: cmd
-        run: |
-          start /B python honeypot.py --port 443 --db https.db --tls-cert %CERT_PEM% --tls-key %KEY_PEM% > https_log.txt 2>&1
-
-      - name: Wait for honeypots
-        shell: cmd
-        run: timeout /t 3 /nobreak > nul
+          $p = Start-Process -FilePath python -ArgumentList "honeypot.py --port 80 --db http.db" -NoNewWindow -PassThru
+          Write-Host "[+] HTTP honeypot PID=$($p.Id)"
+          $p2 = Start-Process -FilePath python -ArgumentList "honeypot.py --port 443 --db https.db --tls-cert $env:CERT_PEM --tls-key $env:KEY_PEM" -NoNewWindow -PassThru
+          Write-Host "[+] HTTPS honeypot PID=$($p2.Id)"
+          Start-Sleep -Seconds 3
 
       - name: Download and Run JQOneMatrixN
-        shell: cmd
+        shell: powershell
         run: |
-          curl -sL -o jqone.exe ^
-            "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe"
-          echo [!] Running JQOneMatrixN...
-          start /B jqone.exe > exe_log.txt 2>&1
+          Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
+          Write-Host "[+] Downloaded $( (Get-Item jqone.exe).length ) bytes"
+          $p = Start-Process -FilePath ".\jqone.exe" -NoNewWindow -PassThru
+          Write-Host "[+] Launched PID=$($p.Id)"
 
       - name: Wait for capture
-        shell: cmd
-        run: timeout /t 120 /nobreak > nul
+        shell: powershell
+        run: |
+          Write-Host "[+] Waiting 90 seconds..."
+          Start-Sleep -Seconds 90
 
       - name: Dump HTTP captures
-        shell: cmd
+        shell: powershell
         run: |
-          curl -s http://127.0.0.1:80/_admin/creds > http_creds.json 2>&1
-          curl -s http://127.0.0.1:80/_admin/stats > http_stats.json 2>&1
-          echo === HTTP STATS ===
-          type http_stats.json
-          echo === HTTP CREDS ===
-          type http_creds.json
+          try { $stats = Invoke-RestMethod -Uri "http://127.0.0.1:80/_admin/stats" } catch { $stats = "FAILED: $_" }
+          try { $creds = Invoke-RestMethod -Uri "http://127.0.0.1:80/_admin/creds" } catch { $creds = "FAILED: $_" }
+          Write-Host "=== HTTP STATS ==="
+          $stats | ConvertTo-Json -Depth 10
+          Write-Host "=== HTTP CREDS ==="
+          $creds | ConvertTo-Json -Depth 10
 
       - name: Dump HTTPS captures
-        shell: cmd
+        shell: powershell
         run: |
-          curl -sk https://127.0.0.1:443/_admin/creds > https_creds.json 2>&1
-          curl -sk https://127.0.0.1:443/_admin/stats > https_stats.json 2>&1
-          echo === HTTPS STATS ===
-          type https_stats.json
-          echo === HTTPS CREDS ===
-          type https_creds.json
+          # Trust all certs for local self-signed
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+          try { $stats = Invoke-RestMethod -Uri "https://127.0.0.1:443/_admin/stats" } catch { $stats = "FAILED: $($_.Exception.Message)" }
+          try { $creds = Invoke-RestMethod -Uri "https://127.0.0.1:443/_admin/creds" } catch { $creds = "FAILED: $($_.Exception.Message)" }
+          Write-Host "=== HTTPS STATS ==="
+          $stats | ConvertTo-Json -Depth 10
+          Write-Host "=== HTTPS CREDS ==="
+          $creds | ConvertTo-Json -Depth 10
 
       - name: Upload artifacts
         if: always()
@@ -111,4 +102,3 @@ jobs:
             *.json
             *.db
             *.txt
-            *_log.txt
