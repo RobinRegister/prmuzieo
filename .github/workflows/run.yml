@@ -11,16 +11,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download EXE
+      - name: Download + Extract DLLs
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/RobinRegister/prmuzieo/releases/download/v1.0/JQOneMatrixN.exe" -OutFile "jqone.exe"
           Write-Host "[+] EXE: $((Get-Item jqone.exe).length) bytes"
 
-      - name: Extract .NET Single-File Bundle
-        shell: powershell
-        run: |
-          # Run the EXE briefly to trigger self-extraction to %TEMP%\.net
+          # Run briefly to trigger self-extraction
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = (Join-Path (Get-Location) "jqone.exe")
           $psi.UseShellExecute = $false
@@ -28,121 +25,92 @@ jobs:
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
           $proc = [System.Diagnostics.Process]::Start($psi)
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 10
           if (-not $proc.HasExited) { $proc.Kill() }
-          Write-Host "[+] EXE ran for 8s"
+          Write-Host "[+] EXE ran 10s"
 
-          # Find extracted assemblies
-          $extractRoot = "$env:LOCALAPPDATA\Temp\.net"
-          if (-not (Test-Path $extractRoot)) { $extractRoot = "$env:TEMP\.net" }
-
-          $dlls = Get-ChildItem -Path $extractRoot -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 100KB } |
-            Sort-Object Length -Descending
+          # Collect ALL extracted assemblies (not just .net temp — also check app temp)
+          mkdir extracted -Force
+          $paths = @(
+            "$env:LOCALAPPDATA\Temp\.net",
+            "$env:TEMP\.net",
+            "$env:LOCALAPPDATA\Temp\.net\JQOneMatrixN",
+            "$env:TEMP\.net\JQOneMatrixN"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Get-ChildItem $p -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-Item $_.FullName "extracted\$($_.Name)" -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
           
-          if ($dlls) {
-            Write-Host "[+] Found $(@($dlls).Count) large DLLs in $extractRoot"
-            mkdir extracted -Force
-            $dlls | ForEach-Object { Copy-Item $_.FullName "extracted\" -Force }
-          } else {
-            Write-Host "[-] No DLLs at $extractRoot"
-            Get-ChildItem "$env:TEMP\.net" -Recurse -Depth 3 -ErrorAction SilentlyContinue |
-              Select-Object FullName, Length | Format-Table -AutoSize
-          }
+          Write-Host "=== Extracted DLLs ==="
+          Get-ChildItem extracted -Filter "*.dll" | Sort-Object Length -Descending | Select-Object Name, Length | Format-Table -AutoSize
+          
+          $count = @(Get-ChildItem extracted -Filter "*.dll").Count
+          Write-Host "[+] Total: $count DLLs"
 
-          Get-ChildItem extracted -Filter "*.dll" | Select-Object Name, Length | Format-Table -AutoSize
-
-      - name: Install de4dot
-        shell: powershell
-        run: |
-          # Download de4dot from GitHub releases
-          $url = "https://github.com/de4dot/de4dot/releases/download/v3.2.0/de4dot-net48.zip"
-          try {
-            Invoke-WebRequest -Uri $url -OutFile "de4dot.zip"
-            Expand-Archive de4dot.zip -DestinationPath de4dot -Force
-            Write-Host "[+] de4dot downloaded"
-          } catch {
-            Write-Host "[-] de4dot download failed: $_"
-            Write-Host "[*] Will continue with obfuscated DLLs"
-          }
-
-      - name: Deobfuscate
+      - name: Scan for License Strings
         shell: powershell
         run: |
           if (-not (Test-Path "extracted\*.dll")) {
-            Write-Host "[-] No DLLs to deobfuscate"
+            Write-Host "[-] No DLLs"
             exit 0
           }
-          
-          if (Test-Path "de4dot\de4dot.exe") {
-            .\de4dot\de4dot.exe -r extracted -o deobfuscated --dont-rename 2>&1 | Select-Object -First 30
-            if (Test-Path "deobfuscated\*.dll") {
-              Write-Host "[+] Deobfuscation successful"
-            }
-          } else {
-            Write-Host "[-] de4dot not available, using obfuscated DLLs"
-            mkdir deobfuscated -Force
-            Copy-Item extracted\*.dll deobfuscated\ -Force
-          }
-          
-          Get-ChildItem deobfuscated -Filter "*.dll" | Select-Object Name, Length | Format-Table -AutoSize
-
-      - name: Scan for License + Key Strings
-        shell: powershell
-        run: |
-          $dir = if (Test-Path deobfuscated) { "deobfuscated" } elseif (Test-Path extracted) { "extracted" } else { $null }
-          if (-not $dir) { Write-Host "[-] Nothing to scan"; exit 0 }
-          
-          Get-ChildItem $dir -Filter "*.dll" | ForEach-Object {
+          Get-ChildItem extracted -Filter "*.dll" | Sort-Object Length -Descending | ForEach-Object {
+            Write-Host "=== $($_.Name) ($([math]::Round($_.Length/1KB))KB) ==="
             $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
             $text = [System.Text.Encoding]::Unicode.GetString($bytes)
-            Write-Host "=== $($_.Name) ($($_.Length) bytes) ==="
-            
             $hits = @("VerifySignature","IsRegisterValid","TGLicense","License",
-                       "BEGIN PUBLIC","RSAKeyValue","Modulus","Exponent",
-                       "BouncyCastle","ECDsa","ProduceLicense","MaxAccounts",
-                       "register_time","ProductFeatures","Expiration","Feature",
-                       "publicKey","PublicKey","PrivateKey","KeyPair")
-            
+                       "BEGIN PUBLIC","RSAKeyValue","Modulus","BouncyCastle",
+                       "ECDsa","ProduceLicense","MaxAccounts","register_time",
+                       "ProductFeatures","Expiration","public.*key","KeyPair",
+                       "Standard.Licensing","VerifyData","SignedXml")
             foreach ($h in $hits) {
-              if ($text -match $h) {
+              if ($text -imatch $h) {
                 $idx = $text.IndexOf($h)
-                $ctx = $text.Substring([Math]::Max(0,$idx-40), [Math]::Min(120, $text.Length - [Math]::Max(0,$idx-40)))
-                Write-Host "  [$h] $ctx"
+                $start = [Math]::Max(0, $idx - 30)
+                $len = [Math]::Min(150, $text.Length - $start)
+                $ctx = $text.Substring($start, $len) -replace '[^\x20-\x7E]','.'
+                Write-Host "  [$h] ...$ctx..."
               }
             }
           }
 
-      - name: Build Patcher + Run
+      - name: Build + Run Patcher
         shell: powershell
         run: |
-          $patcherDir = "patcher"
-          mkdir $patcherDir -Force
-          cd $patcherDir
-          
-          # Create project skeleton
-          dotnet new console --force 2>$null
-          dotnet add package dnlib --version 4.4.0 2>&1 | Select-Object -Last 3
-          
-          # Overwrite auto-generated Program.cs with our patcher
+          mkdir patcher -Force
+          cd patcher
+          dotnet new console --force 2>&1 | Select-Object -Last 3
+          dotnet add package dnlib 2>&1 | Select-Object -Last 3
           Copy-Item -Force ..\Patcher.cs Program.cs
           
-          Write-Host "=== Program.cs (first 5 lines) ==="
-          Get-Content Program.cs | Select-Object -First 5
+          Write-Host "--- Building ---"
+          dotnet build -c Release 2>&1
+          $buildOk = ($LASTEXITCODE -eq 0)
           
-          dotnet build -c Release 2>&1 | Select-Object -Last 8
+          if (-not $buildOk) {
+            Write-Host "[-] Build FAILED"
+            exit 1
+          }
           
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "[+] Built OK"
-            $dllDir = if (Test-Path ..\deobfuscated) { "..\deobfuscated" } elseif (Test-Path ..\extracted) { "..\extracted" } else { "." }
-            $dlls = @(Get-ChildItem $dllDir -Filter "*.dll" | Sort-Object Length -Descending)
-            if ($dlls.Count -gt 0) {
-              dotnet run -c Release -- $dlls[0].FullName 2>&1
-            } else {
-              Write-Host "[-] No DLL found"
-            }
-          } else {
-            Write-Host "[-] Build failed"
+          Write-Host "[+] Build OK"
+          $dllDir = "..\extracted"
+          $dlls = @(Get-ChildItem $dllDir -Filter "*.dll" | Sort-Object Length -Descending)
+          Write-Host "DLLs found: $($dlls.Count)"
+          $dlls | ForEach-Object { Write-Host "  $($_.Name) $($_.Length)" }
+          
+          if ($dlls.Count -eq 0) {
+            Write-Host "[-] No DLLs"
+            exit 1
+          }
+          
+          # Try each DLL — start with the largest (most likely the main app)
+          foreach ($dll in $dlls) {
+            Write-Host "--- Patching $($dll.Name) ---"
+            dotnet run -c Release -- $dll.FullName 2>&1 | Select-Object -First 50
           }
 
       - name: Upload
@@ -152,6 +120,4 @@ jobs:
           name: cracked-output
           path: |
             *_cracked.dll
-            *_patched.dll
-            Patcher.cs
-            deobfuscated/
+            extracted/
